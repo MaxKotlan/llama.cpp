@@ -1,6 +1,7 @@
 #include "llama-bpe-vulkan.h"
 
 #include "llama-vocab.h"
+#include "llama-impl.h"
 
 #ifdef LLAMA_BPE_VULKAN
 
@@ -27,7 +28,7 @@ struct merge_entry {
 
 struct word_meta {
     uint32_t offset = 0;
-    uint32_t length = 0;
+    uint32_t len = 0;
 };
 
 struct link_pair {
@@ -330,7 +331,7 @@ public:
             }
             word_meta m;
             m.offset = static_cast<uint32_t>(symbols.size());
-            m.length = static_cast<uint32_t>(w.size());
+            m.len = static_cast<uint32_t>(w.size());
             meta.push_back(m);
             for (unsigned char c : w) {
                 const std::string s(1, static_cast<char>(c));
@@ -523,7 +524,7 @@ public:
         destroy_all();
 
         for (const auto & m : out_meta) {
-            for (uint32_t i = 0; i < m.length; ++i) {
+            for (uint32_t i = 0; i < m.len; ++i) {
                 const auto tok = out_symbols[m.offset + i];
                 out_tokens.push_back(static_cast<llama_token>(tok));
             }

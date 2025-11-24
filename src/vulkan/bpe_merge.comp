@@ -11,7 +11,7 @@ struct Merge {
 
 struct WordMeta {
     uint offset;
-    uint length;
+    uint len;
 };
 
 struct LinkPair {
@@ -69,17 +69,17 @@ bool find_merge(uint left, uint right, out uint merged, out uint rank_out) {
 void main() {
     uint word_id = gl_GlobalInvocationID.x;
     WordMeta m = meta[word_id];
-    if (m.length == 0) {
+    if (m.len == 0) {
         out_meta[word_id] = WordMeta(0, 0);
         return;
     }
 
     // initialize links for the word range
     uint start = m.offset;
-    for (uint i = 0; i < m.length; ++i) {
+    for (uint i = 0; i < m.len; ++i) {
         uint idx = start + i;
         int prev = (i == 0) ? -1 : int(idx - 1);
-        int next = (i + 1 < m.length) ? int(idx + 1) : -1;
+        int next = (i + 1 < m.len) ? int(idx + 1) : -1;
         links[idx] = LinkPair(prev, next);
     }
 
