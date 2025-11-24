@@ -1,0 +1,135 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+struct Merge {
+    uint left;
+    uint right;
+    uint merged;
+    uint rank;
+};
+
+struct WordMeta {
+    uint offset;
+    uint length;
+};
+
+struct LinkPair {
+    int prev;
+    int next;
+};
+
+layout(std430, binding = 0) readonly buffer MergeBuf {
+    Merge merges[];
+};
+
+layout(std430, binding = 1) readonly buffer MetaBuf {
+    WordMeta meta[];
+};
+
+layout(std430, binding = 2) buffer SymbolsBuf {
+    uint symbols[];
+};
+
+layout(std430, binding = 3) buffer LinksBuf {
+    LinkPair links[];
+};
+
+layout(std430, binding = 4) buffer OutSymbols {
+    uint out_symbols[];
+};
+
+layout(std430, binding = 5) buffer OutMeta {
+    WordMeta out_meta[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint merge_count;
+} pc;
+
+bool find_merge(uint left, uint right, out uint merged, out uint rank_out) {
+    uint lo = 0;
+    uint hi = pc.merge_count;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        Merge m = merges[mid];
+        if (left < m.left || (left == m.left && right < m.right)) {
+            hi = mid;
+        } else if (left > m.left || (left == m.left && right > m.right)) {
+            lo = mid + 1;
+        } else {
+            merged = m.merged;
+            rank_out = m.rank;
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    uint word_id = gl_GlobalInvocationID.x;
+    WordMeta m = meta[word_id];
+    if (m.length == 0) {
+        out_meta[word_id] = WordMeta(0, 0);
+        return;
+    }
+
+    // initialize links for the word range
+    uint start = m.offset;
+    for (uint i = 0; i < m.length; ++i) {
+        uint idx = start + i;
+        int prev = (i == 0) ? -1 : int(idx - 1);
+        int next = (i + 1 < m.length) ? int(idx + 1) : -1;
+        links[idx] = LinkPair(prev, next);
+    }
+
+    while (true) {
+        uint best_rank = 0xffffffffu;
+        int best_left = -1;
+        uint best_merged = 0;
+
+        int cur = int(start);
+        while (cur != -1) {
+            int nxt = links[cur].next;
+            if (nxt == -1) break;
+            uint left_id = symbols[cur];
+            uint right_id = symbols[nxt];
+            uint merged;
+            uint rank;
+            if (find_merge(left_id, right_id, merged, rank)) {
+                if (rank < best_rank) {
+                    best_rank = rank;
+                    best_left = cur;
+                    best_merged = merged;
+                }
+            }
+            cur = nxt;
+        }
+
+        if (best_left == -1) {
+            break;
+        }
+
+        int best_right = links[best_left].next;
+        int right_next = links[best_right].next;
+        symbols[best_left] = best_merged;
+        links[best_left].next = right_next;
+        if (right_next != -1) {
+            links[right_next].prev = best_left;
+        }
+        symbols[best_right] = 0xffffffffu;
+        links[best_right].next = -1;
+        links[best_right].prev = -1;
+    }
+
+    uint out_len = 0;
+    int cur = int(start);
+    while (cur != -1) {
+        if (symbols[cur] != 0xffffffffu) {
+            out_symbols[start + out_len] = symbols[cur];
+            ++out_len;
+        }
+        cur = links[cur].next;
+    }
+    out_meta[word_id] = WordMeta(m.offset, out_len);
+}

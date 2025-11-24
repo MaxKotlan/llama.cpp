@@ -145,6 +145,32 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_BPE_VULKAN)
+    find_package(Vulkan REQUIRED)
+    if (NOT Vulkan_GLSLC_EXECUTABLE)
+        message(FATAL_ERROR "LLAMA_BPE_VULKAN requires glslc from the Vulkan SDK")
+    endif()
+
+    set(LLAMA_BPE_VK_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/bpe_merge.comp)
+    set(LLAMA_BPE_VK_SPV    ${CMAKE_CURRENT_BINARY_DIR}/bpe_merge.spv)
+
+    add_custom_command(
+        OUTPUT ${LLAMA_BPE_VK_SPV}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o ${LLAMA_BPE_VK_SPV} -fshader-stage=compute ${LLAMA_BPE_VK_SHADER}
+        DEPENDS ${LLAMA_BPE_VK_SHADER}
+        COMMENT "Compiling Vulkan BPE shader"
+    )
+
+    add_custom_target(llama-bpe-vulkan-shader DEPENDS ${LLAMA_BPE_VK_SPV})
+    add_dependencies(llama llama-bpe-vulkan-shader)
+
+    target_link_libraries(llama PRIVATE Vulkan::Vulkan)
+    target_compile_definitions(llama PRIVATE
+        LLAMA_BPE_VULKAN
+        LLAMA_BPE_VK_SHADER_PATH="${LLAMA_BPE_VK_SPV}")
+    target_sources(llama PRIVATE llama-bpe-vulkan.cpp)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

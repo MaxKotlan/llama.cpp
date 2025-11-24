@@ -6,6 +6,9 @@
 #include "llama-model-loader.h"
 
 #include "unicode.h"
+#ifdef LLAMA_BPE_VULKAN
+#include "llama-bpe-vulkan.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -13,6 +16,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <forward_list>
 #include <limits>
@@ -470,7 +474,18 @@ struct llm_tokenizer_bpe : llm_tokenizer {
 };
 
 struct llm_tokenizer_bpe_session {
-    llm_tokenizer_bpe_session(const llama_vocab & vocab, const llm_tokenizer_bpe & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
+    llm_tokenizer_bpe_session(const llama_vocab & vocab, const llm_tokenizer_bpe & tokenizer) : vocab(vocab), tokenizer(tokenizer) {
+#ifdef LLAMA_BPE_VULKAN
+        const char * env = getenv("LLAMA_BPE_VK");
+        if (env && env[0] == '1') {
+            vk_engine = llama_bpe_vulkan_create(vocab, vk_max_word_len);
+            vk_enabled = static_cast<bool>(vk_engine);
+            if (!vk_enabled) {
+                LLAMA_LOG_WARN("%s: LLAMA_BPE_VK requested but Vulkan init failed, continuing with CPU tokenizer\n", __func__);
+            }
+        }
+#endif
+    }
 
     static void append(const llama_token token_id, std::vector<llama_token> & output)  {
         output.push_back(token_id);
@@ -510,9 +525,33 @@ struct llm_tokenizer_bpe_session {
     }
 
     void tokenize(const std::string & text, std::vector<llama_token> & output) {
-        int final_prev_index = -1;
         const auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs);
 
+#ifdef LLAMA_BPE_VULKAN
+        if (vk_enabled && vk_engine) {
+            bool gpu_ok = true;
+            for (const auto & word : word_collection) {
+                if ((int) word.size() > vk_max_word_len) {
+                    gpu_ok = false;
+                    break;
+                }
+                if (vocab.get_ignore_merges() && vocab.text_to_token(word) != LLAMA_TOKEN_NULL) {
+                    gpu_ok = false; // avoid behavioral differences
+                    break;
+                }
+            }
+            if (gpu_ok) {
+                std::vector<llama_token> gpu_tokens;
+                if (llama_bpe_vulkan_encode(*vk_engine, word_collection, gpu_tokens)) {
+                    output.insert(output.end(), gpu_tokens.begin(), gpu_tokens.end());
+                    return;
+                }
+                LLAMA_LOG_WARN("%s: Vulkan BPE path failed, falling back to CPU\n", __func__);
+            }
+        }
+#endif
+
+        int final_prev_index = -1;
         symbols_final.clear();
 
         for (const auto & word : word_collection) {
@@ -522,7 +561,6 @@ struct llm_tokenizer_bpe_session {
             int index = 0;
             size_t offset = 0;
 
-            //if (vocab.tokenizer_ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
             if (vocab.get_ignore_merges() && vocab.text_to_token(word) != LLAMA_TOKEN_NULL) {
                 symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
                 offset = word.size();
@@ -647,6 +685,11 @@ private:
     std::vector<llm_symbol> symbols;
     std::vector<llm_symbol> symbols_final;
     llm_bigram_bpe::queue work_queue;
+#ifdef LLAMA_BPE_VULKAN
+    std::unique_ptr<llama_bpe_vulkan> vk_engine;
+    bool vk_enabled = false;
+    static constexpr int vk_max_word_len = 256;
+#endif
 };
 
 //
