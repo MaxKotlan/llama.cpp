@@ -202,12 +202,13 @@ def get_model_name(model_path: Path) -> str:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gguf-py"))
         from gguf import GGUFReader  # type: ignore
 
-        with open(model_path, "rb") as f:
-            reader = GGUFReader(f)
-            kv = reader.meta
-            for key in ("general.name", "model.name"):
-                if key in kv:
-                    return str(kv[key])
+        reader = GGUFReader(model_path)
+        for key in ("general.name", "model.name", "tokenizer.model"):
+            fld = reader.get_field(key)
+            if fld:
+                val = fld.contents()
+                if val:
+                    return str(val)
     except Exception:
         pass
     return model_path.name
