@@ -142,19 +142,49 @@ def collect_series(
     return rows
 
 
-def plot(rows: List[Dict[str, float]], out_path: Path) -> None:
-    tokens = [r["tokens"] for r in rows]
-    t_def = [r["t_default"] for r in rows]
-    t_vk = [r["t_vk"] for r in rows]
+def collect_cold_and_warm(
+    binary: Path,
+    model: Path,
+    corpus: str,
+    target_char_lengths: Iterable[int],
+    cold_runs: int,
+    cold_warmup: int,
+    warm_runs: int,
+    warm_warmup: int,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    print(f"Collecting cold timings (runs={cold_runs}, warmup={cold_warmup}) ...")
+    cold = collect_series(binary, model, corpus, target_char_lengths, runs=cold_runs, warmup=cold_warmup)
+    print(f"\nCollecting warm timings (runs={warm_runs}, warmup={warm_warmup}) ...")
+    warm = collect_series(binary, model, corpus, target_char_lengths, runs=warm_runs, warmup=warm_warmup)
+    return cold, warm
 
-    plt.figure(figsize=(9, 5))
-    plt.scatter(tokens, t_def, color="#1f77b4", label="default")
-    plt.scatter(tokens, t_vk, color="#d62728", label="vulkan (LLAMA_BPE_VK=1)")
-    plt.plot(tokens, t_def, color="#1f77b4", linestyle="--", alpha=0.6)
-    plt.plot(tokens, t_vk, color="#d62728", linestyle="--", alpha=0.6)
+
+def plot(
+    cold: List[Dict[str, float]],
+    warm: List[Dict[str, float]],
+    out_path: Path,
+    title: str,
+) -> None:
+    tokens_c = [r["tokens"] for r in cold]
+    tokens_w = [r["tokens"] for r in warm]
+    t_def_c = [r["t_default"] for r in cold]
+    t_vk_c = [r["t_vk"] for r in cold]
+    t_def_w = [r["t_default"] for r in warm]
+    t_vk_w = [r["t_vk"] for r in warm]
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(tokens_c, t_def_c, color="#1f77b4", marker="o", label="default cold")
+    plt.scatter(tokens_c, t_vk_c, color="#d62728", marker="o", label="vulkan cold")
+    plt.scatter(tokens_w, t_def_w, color="#1f77b4", marker="s", label="default warm")
+    plt.scatter(tokens_w, t_vk_w, color="#d62728", marker="s", label="vulkan warm")
+    plt.plot(tokens_c, t_def_c, color="#1f77b4", linestyle="--", alpha=0.5)
+    plt.plot(tokens_c, t_vk_c, color="#d62728", linestyle="--", alpha=0.5)
+    plt.plot(tokens_w, t_def_w, color="#1f77b4", linestyle="-", alpha=0.8)
+    plt.plot(tokens_w, t_vk_w, color="#d62728", linestyle="-", alpha=0.8)
     plt.xlabel("tokens (prompt)")
     plt.ylabel("wall time (s)")
-    plt.title("Tokenizer performance: default vs Vulkan")
+    model_label = out_path.stem  # fallback
+    plt.title(title or model_label)
     plt.legend()
     plt.grid(True, alpha=0.3)
     out_path.parent.mkdir(exist_ok=True)
@@ -164,19 +194,41 @@ def plot(rows: List[Dict[str, float]], out_path: Path) -> None:
     print(f"Saved plot to {out_path}")
 
 
+def get_model_name(model_path: Path) -> str:
+    # Try to read GGUF metadata for a friendly model name.
+    try:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gguf-py"))
+        from gguf import GGUFReader  # type: ignore
+
+        with open(model_path, "rb") as f:
+            reader = GGUFReader(f)
+            kv = reader.meta
+            for key in ("general.name", "model.name"):
+                if key in kv:
+                    return str(kv[key])
+    except Exception:
+        pass
+    return model_path.name
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark tokenizer default vs Vulkan and plot with matplotlib.")
     parser.add_argument("--binary", default=str(BIN_DEFAULT), help="Path to llama-tokenize binary.")
     parser.add_argument("--model", default=str(MODEL_DEFAULT), help="Path to model GGUF file.")
-    parser.add_argument("--runs", type=int, default=3, help="Measured runs per point.")
-    parser.add_argument("--warmup", type=int, default=1, help="Warmup runs per point (not measured).")
+    parser.add_argument("--runs", type=int, default=3, help="Measured runs per point (warm series).")
+    parser.add_argument("--warmup", type=int, default=1, help="Warmup runs per point (warm series).")
+    parser.add_argument("--cold-runs", type=int, default=1, help="Measured runs per point for cold series.")
+    parser.add_argument("--cold-warmup", type=int, default=0, help="Warmup runs per point for cold series.")
     parser.add_argument(
         "--targets",
         type=str,
-        default="1000,4000,8000,20000,40000,70000,100000",
+        default="1000,4000,8000,20000,40000,70000,100000,250000,500000,750000,1000000",
         help="Comma-separated target token counts (approx; chars use x4).",
     )
     parser.add_argument("--output", default="benchmarks/tokenizer_vulkan_vs_default.png", help="Output plot path.")
+    parser.add_argument("--title", default=None, help="Plot title. Default includes model name if available.")
     return parser.parse_args()
 
 
@@ -192,12 +244,28 @@ def main() -> None:
     targets_tokens = [int(x) for x in args.targets.split(",")]
     target_chars = [t * 4 for t in targets_tokens]
     corpus = load_corpus()
-    print("Collecting timings (default vs LLAMA_BPE_VK) ...")
-    rows = collect_series(binary, model, corpus, target_chars, runs=args.runs, warmup=args.warmup)
-    plot(rows, Path(args.output))
+    cold_rows, warm_rows = collect_cold_and_warm(
+        binary,
+        model,
+        corpus,
+        target_chars,
+        cold_runs=args.cold_runs,
+        cold_warmup=args.cold_warmup,
+        warm_runs=args.runs,
+        warm_warmup=args.warmup,
+    )
+    model_label = get_model_name(model)
+    title = args.title or f"Tokenizer performance (model: {model_label})"
+    plot(cold_rows, warm_rows, Path(args.output), title=title)
 
-    print("\nSummary (tokens ~ avg time seconds):")
-    for r in rows:
+    print("\nSummary cold (tokens ~ avg time seconds):")
+    for r in cold_rows:
+        print(
+            f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
+            f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
+        )
+    print("\nSummary warm (tokens ~ avg time seconds):")
+    for r in warm_rows:
         print(
             f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
             f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
