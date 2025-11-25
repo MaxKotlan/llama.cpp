@@ -218,6 +218,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark tokenizer default vs Vulkan and plot with matplotlib.")
     parser.add_argument("--binary", default=str(BIN_DEFAULT), help="Path to llama-tokenize binary.")
     parser.add_argument("--model", default=str(MODEL_DEFAULT), help="Path to model GGUF file.")
+    parser.add_argument(
+        "--models",
+        default=None,
+        help="Comma-separated list of model paths. If set, overrides --model.",
+    )
     parser.add_argument("--runs", type=int, default=3, help="Measured runs per point (warm series).")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs per point (warm series).")
     parser.add_argument("--cold-runs", type=int, default=1, help="Measured runs per point for cold series.")
@@ -228,7 +233,12 @@ def parse_args() -> argparse.Namespace:
         default="1000,4000,8000,20000,40000,70000,100000,250000,500000,750000,1000000",
         help="Comma-separated target token counts (approx; chars use x4).",
     )
-    parser.add_argument("--output", default="benchmarks/tokenizer_vulkan_vs_default.png", help="Output plot path.")
+    parser.add_argument("--output", default=None, help="Output plot path (single-model mode).")
+    parser.add_argument(
+        "--output-dir",
+        default="benchmarks",
+        help="Directory for output plots (used for multi-model runs).",
+    )
     parser.add_argument("--title", default=None, help="Plot title. Default includes model name if available.")
     return parser.parse_args()
 
@@ -236,41 +246,57 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     binary = Path(args.binary)
-    model = Path(args.model)
     if not binary.exists():
         raise SystemExit(f"Missing tokenizer binary at {binary}")
-    if not model.exists():
-        raise SystemExit(f"Missing model at {model}")
+
+    if args.models:
+        model_paths = [Path(m.strip()) for m in args.models.split(",") if m.strip()]
+    else:
+        model_paths = [Path(args.model)]
 
     targets_tokens = [int(x) for x in args.targets.split(",")]
     target_chars = [t * 4 for t in targets_tokens]
     corpus = load_corpus()
-    cold_rows, warm_rows = collect_cold_and_warm(
-        binary,
-        model,
-        corpus,
-        target_chars,
-        cold_runs=args.cold_runs,
-        cold_warmup=args.cold_warmup,
-        warm_runs=args.runs,
-        warm_warmup=args.warmup,
-    )
-    model_label = get_model_name(model)
-    title = args.title or f"Tokenizer performance (model: {model_label})"
-    plot(cold_rows, warm_rows, Path(args.output), title=title)
 
-    print("\nSummary cold (tokens ~ avg time seconds):")
-    for r in cold_rows:
-        print(
-            f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
-            f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
-        )
-    print("\nSummary warm (tokens ~ avg time seconds):")
-    for r in warm_rows:
-        print(
-            f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
-            f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
-        )
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    for model in model_paths:
+        if not model.exists():
+            print(f"Skipping missing model: {model}")
+            continue
+        try:
+            cold_rows, warm_rows = collect_cold_and_warm(
+                binary,
+                model,
+                corpus,
+                target_chars,
+                cold_runs=args.cold_runs,
+                cold_warmup=args.cold_warmup,
+                warm_runs=args.runs,
+                warm_warmup=args.warmup,
+            )
+        except Exception as e:
+            print(f"Skipping model {model} due to error: {e}")
+            continue
+        model_label = get_model_name(model)
+        safe_label = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_label)
+        out_path = Path(args.output) if args.output and len(model_paths) == 1 else out_dir / f"tokenizer_vulkan_vs_default_{safe_label}.png"
+        title = args.title or f"Tokenizer performance (model: {model_label})"
+        plot(cold_rows, warm_rows, out_path, title=title)
+
+        print(f"\nSummary cold (tokens ~ avg time seconds) for {model_label}:")
+        for r in cold_rows:
+            print(
+                f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
+                f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
+            )
+        print(f"\nSummary warm (tokens ~ avg time seconds) for {model_label}:")
+        for r in warm_rows:
+            print(
+                f"{r['tokens']:>8} tokens | default {r['t_default']:.3f}s | "
+                f"vulkan {r['t_vk']:.3f}s | chars target {r['target_chars']}"
+            )
 
 
 if __name__ == "__main__":
