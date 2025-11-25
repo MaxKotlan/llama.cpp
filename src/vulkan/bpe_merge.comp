@@ -1,7 +1,8 @@
 #version 450
 
 // Parallel-ish BPE merge: one workgroup per word.
-// Threads cooperate to find the best-ranked merge each iteration via reduction.
+// Threads cooperatively identify non-conflicting local-minimum merges and apply merges.
+// When approx_mode is enabled, only a single pass is executed (no convergence loop).
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 // Assumes max_word_len <= 256 (matches llama vocab limit).
@@ -50,13 +51,15 @@ layout(std430, binding = 5) buffer OutMeta {
 
 layout(push_constant) uniform PushConsts {
     uint merge_count;
+    uint fast_mode;
+    uint approx_mode;
 } pc;
 
 shared uint   sh_symbols[MAX_WORD_LEN];
-shared int    sh_next[MAX_WORD_LEN];
-shared uint   sh_rank[32];
-shared int    sh_left[32];
-shared uint   sh_merged[32];
+shared uint   sh_rank[MAX_WORD_LEN];
+shared uint   sh_merged[MAX_WORD_LEN];
+shared uint   sh_winner[MAX_WORD_LEN];
+shared uint   sh_temp[MAX_WORD_LEN];
 
 bool find_merge(uint left, uint right, out uint merged, out uint rank_out) {
     uint lo = 0;
@@ -86,75 +89,107 @@ void main() {
         return;
     }
 
-    // load symbols and init linked list into shared
+    // load symbols into shared
     if (lane < m.len) {
         uint idx = m.offset + lane;
         sh_symbols[lane] = symbols[idx];
-        sh_next[lane] = (lane + 1 < m.len) ? int(lane + 1) : -1;
     }
     barrier();
 
     uint current_len = m.len;
 
-    while (true) {
-        uint best_rank = 0xffffffffu;
-        int best_left = -1;
-        uint best_merged = 0;
-
-        // each lane scans a strided subset of pairs
-        for (uint i = lane; i + 1 < current_len; i += gl_WorkGroupSize.x) {
-            uint left_id = sh_symbols[i];
-            uint right_id = sh_symbols[i + 1];
-            uint merged;
-            uint rank;
-            if (find_merge(left_id, right_id, merged, rank)) {
-                if (rank < best_rank) {
-                    best_rank = rank;
-                    best_left = int(i);
-                    best_merged = merged;
-                }
-            }
-        }
-
-        // write to shared for reduction
-        sh_rank[lane] = best_rank;
-        sh_left[lane] = best_left;
-        sh_merged[lane] = best_merged;
-        barrier();
-
-        // reduction in shared memory
-        for (uint offset = gl_WorkGroupSize.x / 2; offset > 0; offset >>= 1) {
-            if (lane < offset) {
-                uint o_rank = sh_rank[lane + offset];
-                int  o_left = sh_left[lane + offset];
-                uint o_merge = sh_merged[lane + offset];
-                if (o_rank < sh_rank[lane]) {
-                    sh_rank[lane] = o_rank;
-                    sh_left[lane] = o_left;
-                    sh_merged[lane] = o_merge;
+    // run either one pass (approx) or loop to convergence (exact)
+    bool more = true;
+    while (more) {
+        // compute candidate ranks
+        if (pc.fast_mode == 0u) {
+            // exact-ish: rank-based local minima
+            for (uint i = lane; i < current_len; i += gl_WorkGroupSize.x) {
+                if (i + 1 < current_len) {
+                    uint left_id = sh_symbols[i];
+                    uint right_id = sh_symbols[i + 1];
+                    uint merged;
+                    uint rank;
+                    if (find_merge(left_id, right_id, merged, rank)) {
+                        sh_rank[i] = rank;
+                        sh_merged[i] = merged;
+                    } else {
+                        sh_rank[i] = 0xffffffffu;
+                        sh_merged[i] = 0;
+                    }
+                } else {
+                    sh_rank[i] = 0xffffffffu;
+                    sh_merged[i] = 0;
                 }
             }
             barrier();
-        }
 
-        best_rank = sh_rank[0];
-        best_left = sh_left[0];
-        best_merged = sh_merged[0];
-
-        if (best_left < 0 || best_rank == 0xffffffffu) {
-            break;
-        }
-
-        // lane 0 applies merge
-        if (lane == 0) {
-            uint left_idx = uint(best_left);
-            uint right_idx = left_idx + 1;
-            sh_symbols[left_idx] = best_merged;
-            // shift symbols left by 1 from right_idx+1 .. end
-            for (uint i = right_idx + 1; i < current_len; ++i) {
-                sh_symbols[i - 1] = sh_symbols[i];
+            for (uint i = lane; i < current_len; i += gl_WorkGroupSize.x) {
+                uint r = sh_rank[i];
+                uint lrank = (i == 0) ? 0xffffffffu : sh_rank[i - 1];
+                uint rrank = (i + 1 >= current_len - 1) ? 0xffffffffu : sh_rank[i + 1];
+                bool win = (r != 0xffffffffu) && (r < lrank) && (r <= rrank);
+                sh_winner[i] = win ? 1u : 0u;
             }
-            current_len -= 1;
+        } else {
+            // fast approximate: merge any eligible pair, skipping neighbors
+            for (uint i = lane; i < current_len; i += gl_WorkGroupSize.x) {
+                if (i + 1 < current_len) {
+                    uint left_id = sh_symbols[i];
+                    uint right_id = sh_symbols[i + 1];
+                    uint merged;
+                    uint rank;
+                    if (find_merge(left_id, right_id, merged, rank)) {
+                        sh_rank[i] = rank;
+                        sh_merged[i] = merged;
+                        sh_winner[i] = 1u;
+                    } else {
+                        sh_rank[i] = 0xffffffffu;
+                        sh_merged[i] = 0;
+                        sh_winner[i] = 0u;
+                    }
+                } else {
+                    sh_rank[i] = 0xffffffffu;
+                    sh_merged[i] = 0;
+                    sh_winner[i] = 0u;
+                }
+            }
+        }
+        barrier();
+
+        // lane 0 compacts symbols after applying merges
+        if (lane == 0) {
+            uint out_len = 0;
+            uint i = 0;
+            while (i < current_len) {
+                if (sh_winner[i] == 1u) {
+                    sh_temp[out_len++] = sh_merged[i];
+                    // skip merged pair
+                    i += 2;
+                } else {
+                    sh_temp[out_len++] = sh_symbols[i];
+                    i += 1;
+                }
+            }
+            // detect no-change
+            if (out_len == current_len) {
+                current_len = out_len;
+                for (uint k = 0; k < current_len; ++k) sh_symbols[k] = sh_temp[k];
+                // no winners; break
+                current_len = out_len;
+                sh_rank[0] = 0; // signal done
+            } else {
+                current_len = out_len;
+                for (uint k = 0; k < current_len; ++k) sh_symbols[k] = sh_temp[k];
+                sh_rank[0] = 1; // signal continue
+            }
+        }
+        barrier();
+
+        if (pc.approx_mode == 1u) {
+            more = false; // single pass
+        } else {
+            more = (sh_rank[0] != 0);
         }
         barrier();
     }

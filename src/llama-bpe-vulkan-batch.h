@@ -1,26 +1,18 @@
 #pragma once
 
 #include "llama.h"
-
 #include <memory>
-#include <string>
 #include <vector>
+#include <string>
 
 struct llama_vocab;
 
-struct llama_bpe_vulkan {
-    virtual ~llama_bpe_vulkan() = default;
-    virtual bool encode(const std::vector<std::string> & words, std::vector<llama_token> & out_tokens) = 0;
-};
-
 // Create a Vulkan-backed BPE tokenizer helper.
-// Returns nullptr if Vulkan is unavailable or the vocab cannot be mapped to token ids.
 std::unique_ptr<llama_bpe_vulkan> llama_bpe_vulkan_create(const llama_vocab & vocab, int max_word_len);
-
-// Encode a batch of already pre-tokenized words. Returns false on failure and leaves output untouched.
 bool llama_bpe_vulkan_encode(llama_bpe_vulkan & engine, const std::vector<std::string> & words, std::vector<llama_token> & out_tokens);
 
-// Batched encode: flatten multiple word lists into one dispatch.
+// Batched encode: flattens multiple prompts (each split into words) and runs one Vulkan dispatch.
+// Returns false if any prompt exceeds max_word_len or a Vulkan failure occurs.
 bool llama_bpe_vulkan_encode_batch(
     llama_bpe_vulkan & engine,
     const std::vector<std::vector<std::string>> & batch_words,

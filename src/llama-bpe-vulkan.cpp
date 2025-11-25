@@ -254,7 +254,7 @@ public:
         VkPushConstantRange range{};
         range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         range.offset = 0;
-        range.size = sizeof(uint32_t);
+        range.size = sizeof(uint32_t) * 2; // merge_count + fast_mode
 
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plci.setLayoutCount = 1;
@@ -337,39 +337,79 @@ public:
     }
 
     bool ok() const { return ready; }
+    void set_fast_mode(bool v) { fast_mode = v; }
+    void set_approx_mode(bool v) { approx_mode = v; }
+    int get_max_word_len() const { return max_word_len; }
 
     bool encode(const std::vector<std::string> & words, std::vector<llama_token> & out_tokens) override {
         if (!ready || words.empty()) {
             return false;
         }
-        // Build initial symbol stream from bytes
+        return encode_single(words, out_tokens);
+    }
+
+    bool encode_batch_public(const std::vector<std::vector<std::string>> & batch_words,
+                             std::vector<std::vector<llama_token>> & out_tokens_batch) {
+        return encode_batch(batch_words, out_tokens_batch);
+    }
+
+private:
+    bool encode_single(const std::vector<std::string> & words, std::vector<llama_token> & out_tokens) {
+        std::vector<std::vector<std::string>> batch{words};
+        std::vector<std::vector<llama_token>> out_batch;
+        if (!encode_batch(batch, out_batch)) return false;
+        out_tokens = std::move(out_batch[0]);
+        return true;
+    }
+
+    bool encode_batch(const std::vector<std::vector<std::string>> & batch_words,
+                      std::vector<std::vector<llama_token>> & out_tokens_batch) {
+        // flatten words
         std::vector<word_meta> meta;
         std::vector<uint32_t> symbols;
-        meta.reserve(words.size());
-
-        for (const auto & w : words) {
-            if (static_cast<int>(w.size()) > max_word_len) {
-                return false;
-            }
-            word_meta m;
-            m.offset = static_cast<uint32_t>(symbols.size());
-            m.len = static_cast<uint32_t>(w.size());
-            meta.push_back(m);
-            for (unsigned char c : w) {
-                const std::string s(1, static_cast<char>(c));
-                const auto id = vocab.text_to_token(s);
-                if (id == LLAMA_TOKEN_NULL) {
+        meta.reserve(batch_words.size() * 8);
+        for (const auto & words : batch_words) {
+            for (const auto & w : words) {
+                if (static_cast<int>(w.size()) > max_word_len) {
                     return false;
                 }
-                symbols.push_back(static_cast<uint32_t>(id));
+                word_meta m;
+                m.offset = static_cast<uint32_t>(symbols.size());
+                m.len = static_cast<uint32_t>(w.size());
+                meta.push_back(m);
+                for (unsigned char c : w) {
+                    const std::string s(1, static_cast<char>(c));
+                    const auto id = vocab.text_to_token(s);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        return false;
+                    }
+                    symbols.push_back(static_cast<uint32_t>(id));
+                }
             }
         }
+        if (symbols.empty()) return false;
 
-        const size_t total_symbols = symbols.size();
-        if (total_symbols == 0) {
-            return false;
+        if (!encode_flat(meta, symbols)) return false;
+
+        // split outputs
+        out_tokens_batch.clear();
+        out_tokens_batch.reserve(batch_words.size());
+        size_t meta_idx = 0;
+        for (const auto & words : batch_words) {
+            std::vector<llama_token> toks;
+            for (size_t i = 0; i < words.size(); ++i) {
+                const auto & m = last_out_meta[meta_idx];
+                for (uint32_t j = 0; j < m.len; ++j) {
+                    toks.push_back(static_cast<llama_token>(last_out_symbols[m.offset + j]));
+                }
+                ++meta_idx;
+            }
+            out_tokens_batch.push_back(std::move(toks));
         }
+        return true;
+    }
 
+    bool encode_flat(const std::vector<word_meta> & meta, const std::vector<uint32_t> & symbols) {
         const VkDeviceSize meta_size = sizeof(word_meta) * meta.size();
         const VkDeviceSize sym_size = sizeof(uint32_t) * symbols.size();
         const VkDeviceSize links_size = sizeof(link_pair) * symbols.size();
@@ -389,15 +429,12 @@ public:
         out_ptr = out_buf.ptr;
         out_meta_ptr = out_meta_buf.ptr;
 
-        // upload inputs
         std::memcpy(meta_ptr, meta.data(), meta_size);
         std::memcpy(symbols_ptr, symbols.data(), sym_size);
         std::memset(links_ptr, 0xff, links_size); // initialize links to -1
 
-        // Update descriptors in case buffers resized
         update_descriptors();
 
-        // record command buffer
         vkResetCommandPool(ctx.device, ctx.command_pool, 0);
         VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         if (vkBeginCommandBuffer(cmd, &cbbi) != VK_SUCCESS) {
@@ -405,8 +442,8 @@ public:
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline_layout, 0, 1, &descriptor_set, 0, nullptr);
-        uint32_t merge_count = static_cast<uint32_t>(merges.size());
-        vkCmdPushConstants(cmd, ctx.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &merge_count);
+        uint32_t pc_data[3] = { static_cast<uint32_t>(merges.size()), fast_mode ? 1u : 0u, approx_mode ? 1u : 0u };
+        vkCmdPushConstants(cmd, ctx.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_data), pc_data);
         vkCmdDispatch(cmd, static_cast<uint32_t>(meta.size()), 1, 1);
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
             return false;
@@ -429,27 +466,16 @@ public:
         }
         vkDestroyFence(ctx.device, fence, nullptr);
 
-        // read back (buffers are host coherent; invalidate for safety)
         out_buf.buf.invalidate(ctx.device, out_size);
         out_meta_buf.buf.invalidate(ctx.device, out_meta_size);
 
-        std::vector<word_meta> out_meta(meta.size());
-        std::memcpy(out_meta.data(), out_meta_ptr, out_meta_size);
-
-        std::vector<uint32_t> out_symbols(symbols.size());
-        std::memcpy(out_symbols.data(), out_ptr, out_size);
-
-        for (const auto & m : out_meta) {
-            for (uint32_t i = 0; i < m.len; ++i) {
-                const auto tok = out_symbols[m.offset + i];
-                out_tokens.push_back(static_cast<llama_token>(tok));
-            }
-        }
-
+        last_out_meta.resize(meta.size());
+        last_out_symbols.resize(symbols.size());
+        std::memcpy(last_out_meta.data(), out_meta_ptr, out_meta_size);
+        std::memcpy(last_out_symbols.data(), out_ptr, out_size);
         return true;
     }
 
-private:
     struct mapped_buffer {
         vk_buffer buf;
         void * ptr = nullptr;
@@ -568,7 +594,11 @@ private:
     void * links_ptr = nullptr;
     void * out_ptr = nullptr;
     void * out_meta_ptr = nullptr;
+    bool fast_mode = false;
+    bool approx_mode = false;
     bool ready = false;
+    std::vector<word_meta> last_out_meta;
+    std::vector<uint32_t> last_out_symbols;
 };
 
 std::vector<merge_entry> build_merge_table(const llama_vocab & vocab) {
@@ -633,10 +663,28 @@ std::unique_ptr<llama_bpe_vulkan> llama_bpe_vulkan_create(const llama_vocab & vo
     }
 
     auto impl = std::make_unique<llama_bpe_vulkan_impl>(vocab, max_word_len, std::move(merges), std::move(shader_code));
+    // Fast/approx mode toggle via env
+    const char * fast_env = std::getenv("LLAMA_BPE_VK_FAST");
+    if (fast_env && std::strlen(fast_env) > 0 && impl) {
+        impl->set_fast_mode(true);
+    }
+    const char * approx_env = std::getenv("LLAMA_BPE_VK_APPROX");
+    if (approx_env && std::strlen(approx_env) > 0 && impl) {
+        impl->set_approx_mode(true);
+    }
     if (!impl->ok()) {
         return nullptr;
     }
     return impl;
+}
+
+bool llama_bpe_vulkan_encode_batch(
+    llama_bpe_vulkan & engine,
+    const std::vector<std::vector<std::string>> & batch_words,
+    std::vector<std::vector<llama_token>> & out_tokens_batch) {
+    auto * impl = dynamic_cast<llama_bpe_vulkan_impl *>(&engine);
+    if (!impl) return false;
+    return impl->encode_batch_public(batch_words, out_tokens_batch);
 }
 
 bool llama_bpe_vulkan_encode(llama_bpe_vulkan & engine, const std::vector<std::string> & words, std::vector<llama_token> & out_tokens) {

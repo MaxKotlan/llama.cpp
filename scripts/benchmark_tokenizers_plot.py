@@ -142,6 +142,60 @@ def collect_series(
     return rows
 
 
+def collect_series_batched(
+    binary: Path,
+    model: Path,
+    corpus: str,
+    target_char_lengths: Iterable[int],
+    runs: int,
+    warmup: int,
+    batch_size: int,
+) -> List[Dict[str, float]]:
+    # Batch the same prompt N times to amortize overhead; report per-prompt time.
+    rows = []
+    for target in target_char_lengths:
+        prompt = make_prompt(corpus, target)
+        prompts = [prompt] * batch_size
+        # warmup
+        for _ in range(warmup):
+            tokenize_once(binary, model, prompt, env_extra={})
+            tokenize_once(binary, model, prompt, env_extra={"LLAMA_BPE_VK": "1"})
+
+        times_def: List[float] = []
+        times_vk: List[float] = []
+        tokens_ref = None
+        for _ in range(runs):
+            elapsed_def = 0.0
+            for p in prompts:
+                t_def, tokens = tokenize_once(binary, model, p, env_extra={})
+                elapsed_def += t_def
+                if tokens_ref is None:
+                    tokens_ref = tokens
+            elapsed_vk = 0.0
+            for p in prompts:
+                t_vk, tokens_vk = tokenize_once(binary, model, p, env_extra={"LLAMA_BPE_VK": "1"})
+                elapsed_vk += t_vk
+                if tokens_ref is not None and tokens_vk != tokens_ref:
+                    raise RuntimeError(f"Token mismatch in batch at chars={target}")
+            times_def.append(elapsed_def / batch_size)
+            times_vk.append(elapsed_vk / batch_size)
+
+        rows.append(
+            {
+                "target_chars": target,
+                "tokens": tokens_ref or -1,
+                "t_default": mean(times_def),
+                "t_vk": mean(times_vk),
+            }
+        )
+        print(
+            f"[batch={batch_size}] chars ~{target:>7}, tokens {tokens_ref:>7} | "
+            f"default avg {mean(times_def):.3f}s | vulkan avg {mean(times_vk):.3f}s "
+            f"(runs={runs}, warmup={warmup})"
+        )
+    return rows
+
+
 def collect_cold_and_warm(
     binary: Path,
     model: Path,
@@ -240,6 +294,8 @@ def parse_args() -> argparse.Namespace:
         help="Directory for output plots (used for multi-model runs).",
     )
     parser.add_argument("--title", default=None, help="Plot title. Default includes model name if available.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Number of prompts to batch together.")
+    parser.add_argument("--fast-vk", action="store_true", help="Set LLAMA_BPE_VK_FAST=1 for approximate Vulkan path.")
     return parser.parse_args()
 
 
