@@ -37,6 +37,7 @@ struct link_pair {
 };
 
 constexpr uint32_t INVALID_SYMBOL = 0xffffffffu;
+constexpr float   GROWTH_FACTOR   = 1.5f;
 
 bool read_file(const char * path, std::vector<uint32_t> & data) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -112,6 +113,10 @@ public:
     }
 
     void destroy() {
+        if (mapped && memory != VK_NULL_HANDLE) {
+            vkUnmapMemory(device, memory);
+            mapped = false;
+        }
         if (buffer != VK_NULL_HANDLE) {
             vkDestroyBuffer(device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
@@ -127,16 +132,29 @@ public:
         if (vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS) {
             return nullptr;
         }
+        mapped = true;
         return ptr;
     }
 
     void unmap(VkDevice device) {
-        vkUnmapMemory(device, memory);
+        if (mapped) {
+            vkUnmapMemory(device, memory);
+            mapped = false;
+        }
+    }
+
+    bool invalidate(VkDevice device, VkDeviceSize size) {
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = memory;
+        range.offset = 0;
+        range.size = size;
+        return vkInvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS;
     }
 
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    bool mapped = false;
 };
 
 class vk_context {
@@ -306,11 +324,15 @@ public:
         if (ready) {
             ready = upload_merges();
         }
+        if (ready) {
+            ready = allocate_persistent();
+        }
     }
 
     ~llama_bpe_vulkan_impl() override {
         if (ready) {
             merges_buffer.destroy();
+            destroy_persistent();
         }
     }
 
@@ -348,125 +370,45 @@ public:
             return false;
         }
 
-        vk_buffer meta_buf;
-        vk_buffer symbols_buf;
-        vk_buffer links_buf;
-        vk_buffer out_buf;
-        vk_buffer out_meta_buf;
-
-        auto destroy_all = [&]() {
-            meta_buf.destroy();
-            symbols_buf.destroy();
-            links_buf.destroy();
-            out_buf.destroy();
-            out_meta_buf.destroy();
-        };
-
-        meta_buf.device = ctx.device;
-        symbols_buf.device = ctx.device;
-        links_buf.device = ctx.device;
-        out_buf.device = ctx.device;
-        out_meta_buf.device = ctx.device;
-
         const VkDeviceSize meta_size = sizeof(word_meta) * meta.size();
         const VkDeviceSize sym_size = sizeof(uint32_t) * symbols.size();
         const VkDeviceSize links_size = sizeof(link_pair) * symbols.size();
         const VkDeviceSize out_size = sym_size;
         const VkDeviceSize out_meta_size = sizeof(word_meta) * meta.size();
 
-        if (!meta_buf.create(ctx.device, ctx.phys_device, meta_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-            !symbols_buf.create(ctx.device, ctx.phys_device, sym_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-            !links_buf.create(ctx.device, ctx.phys_device, links_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-            !out_buf.create(ctx.device, ctx.phys_device, out_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-            !out_meta_buf.create(ctx.device, ctx.phys_device, out_meta_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
-            destroy_all();
+        if (!ensure_capacity(meta_buf, meta_size) ||
+            !ensure_capacity(symbols_buf, sym_size) ||
+            !ensure_capacity(links_buf, links_size) ||
+            !ensure_capacity(out_buf, out_size) ||
+            !ensure_capacity(out_meta_buf, out_meta_size)) {
             return false;
         }
+        meta_ptr = meta_buf.ptr;
+        symbols_ptr = symbols_buf.ptr;
+        links_ptr = links_buf.ptr;
+        out_ptr = out_buf.ptr;
+        out_meta_ptr = out_meta_buf.ptr;
 
         // upload inputs
-        {
-            void * ptr = meta_buf.map(ctx.device);
-            if (ptr == nullptr) {
-                vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-                destroy_all();
-                return false;
-            }
-            std::memcpy(ptr, meta.data(), meta_size);
-            meta_buf.unmap(ctx.device);
-        }
-        {
-            void * ptr = symbols_buf.map(ctx.device);
-            if (ptr == nullptr) {
-                vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-                destroy_all();
-                return false;
-            }
-            std::memcpy(ptr, symbols.data(), sym_size);
-            symbols_buf.unmap(ctx.device);
-        }
-        {
-            // links start as -1/next initialization happens in shader
-            void * ptr = links_buf.map(ctx.device);
-            if (ptr == nullptr) {
-                vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-                destroy_all();
-                return false;
-            }
-            std::memset(ptr, 0xff, links_size);
-            links_buf.unmap(ctx.device);
-        }
+        std::memcpy(meta_ptr, meta.data(), meta_size);
+        std::memcpy(symbols_ptr, symbols.data(), sym_size);
+        std::memset(links_ptr, 0xff, links_size); // initialize links to -1
 
-        auto maybe_set = ctx.allocate_descriptor_set();
-        if (!maybe_set.has_value()) {
-            destroy_all();
-            return false;
-        }
-        const VkDescriptorSet set = maybe_set.value();
+        // Update descriptors in case buffers resized
+        update_descriptors();
 
-        const VkDescriptorBufferInfo merge_info{merges_buffer.buffer, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo meta_info{meta_buf.buffer, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo sym_info{symbols_buf.buffer, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo links_info{links_buf.buffer, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo out_info{out_buf.buffer, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo out_meta_info{out_meta_buf.buffer, 0, VK_WHOLE_SIZE};
-
-        VkWriteDescriptorSet writes[6]{};
-        const VkDescriptorBufferInfo infos[6] = {merge_info, meta_info, sym_info, links_info, out_info, out_meta_info};
-        for (uint32_t i = 0; i < 6; ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = set;
-            writes[i].dstBinding = i;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].descriptorCount = 1;
-            writes[i].pBufferInfo = &infos[i];
-        }
-        vkUpdateDescriptorSets(ctx.device, 6, writes, 0, nullptr);
-
-        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbai.commandPool = ctx.command_pool;
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(ctx.device, &cbai, &cmd) != VK_SUCCESS) {
-            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-            destroy_all();
-            return false;
-        }
-
+        // record command buffer
+        vkResetCommandPool(ctx.device, ctx.command_pool, 0);
         VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         if (vkBeginCommandBuffer(cmd, &cbbi) != VK_SUCCESS) {
-            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-            destroy_all();
             return false;
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline_layout, 0, 1, &descriptor_set, 0, nullptr);
         uint32_t merge_count = static_cast<uint32_t>(merges.size());
         vkCmdPushConstants(cmd, ctx.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &merge_count);
         vkCmdDispatch(cmd, static_cast<uint32_t>(meta.size()), 1, 1);
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-            destroy_all();
             return false;
         }
 
@@ -478,50 +420,24 @@ public:
         vkCreateFence(ctx.device, &fci, nullptr, &fence);
 
         if (vkQueueSubmit(ctx.queue, 1, &si, fence) != VK_SUCCESS) {
-            vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
             vkDestroyFence(ctx.device, fence, nullptr);
-            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-            destroy_all();
             return false;
         }
         if (vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-            vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
             vkDestroyFence(ctx.device, fence, nullptr);
-            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-            destroy_all();
             return false;
         }
         vkDestroyFence(ctx.device, fence, nullptr);
-        vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
 
-        // read back
+        // read back (buffers are host coherent; invalidate for safety)
+        out_buf.buf.invalidate(ctx.device, out_size);
+        out_meta_buf.buf.invalidate(ctx.device, out_meta_size);
+
         std::vector<word_meta> out_meta(meta.size());
-        {
-            void * ptr = out_meta_buf.map(ctx.device);
-            if (ptr == nullptr) {
-                vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-                destroy_all();
-                return false;
-            }
-            std::memcpy(out_meta.data(), ptr, out_meta_size);
-            out_meta_buf.unmap(ctx.device);
-        }
+        std::memcpy(out_meta.data(), out_meta_ptr, out_meta_size);
 
         std::vector<uint32_t> out_symbols(symbols.size());
-        {
-            void * ptr = out_buf.map(ctx.device);
-            if (ptr == nullptr) {
-                vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-                destroy_all();
-                return false;
-            }
-            std::memcpy(out_symbols.data(), ptr, out_size);
-            out_buf.unmap(ctx.device);
-        }
-
-        vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
-
-        destroy_all();
+        std::memcpy(out_symbols.data(), out_ptr, out_size);
 
         for (const auto & m : out_meta) {
             for (uint32_t i = 0; i < m.len; ++i) {
@@ -534,6 +450,12 @@ public:
     }
 
 private:
+    struct mapped_buffer {
+        vk_buffer buf;
+        void * ptr = nullptr;
+        size_t capacity = 0;
+    };
+
     bool upload_merges() {
         merges_buffer.device = ctx.device;
         const VkDeviceSize size = sizeof(merge_entry) * merges.size();
@@ -546,11 +468,106 @@ private:
         return true;
     }
 
+    bool allocate_persistent() {
+        // descriptor set and command buffer allocated once
+        auto maybe_set = ctx.allocate_descriptor_set();
+        if (!maybe_set.has_value()) {
+            return false;
+        }
+        descriptor_set = maybe_set.value();
+
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = ctx.command_pool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(ctx.device, &cbai, &cmd) != VK_SUCCESS) {
+            return false;
+        }
+        return true;
+    }
+
+    void destroy_persistent() {
+        if (descriptor_set != VK_NULL_HANDLE) {
+            vkResetDescriptorPool(ctx.device, ctx.descriptor_pool, 0);
+            descriptor_set = VK_NULL_HANDLE;
+        }
+        if (cmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
+            cmd = VK_NULL_HANDLE;
+        }
+        meta_buf.buf.destroy();
+        symbols_buf.buf.destroy();
+        links_buf.buf.destroy();
+        out_buf.buf.destroy();
+        out_meta_buf.buf.destroy();
+    }
+
+    bool ensure_capacity(mapped_buffer & mbuf, size_t bytes) {
+        if (bytes == 0) {
+            bytes = 1; // avoid zero-sized allocation
+        }
+        if (mbuf.capacity >= bytes) {
+            return true;
+        }
+        mbuf.buf.destroy();
+        mbuf.buf.device = ctx.device;
+        size_t new_size = static_cast<size_t>(bytes * GROWTH_FACTOR);
+        if (new_size < bytes) new_size = bytes;
+        if (!mbuf.buf.create(ctx.device, ctx.phys_device, new_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+            return false;
+        }
+        mbuf.ptr = mbuf.buf.map(ctx.device);
+        if (mbuf.ptr == nullptr) {
+            return false;
+        }
+        mbuf.capacity = new_size;
+        descriptors_dirty = true;
+        return true;
+    }
+
+    void update_descriptors() {
+        if (!descriptors_dirty) {
+            return;
+        }
+        const VkDescriptorBufferInfo merge_info{merges_buffer.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo meta_info{meta_buf.buf.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo sym_info{symbols_buf.buf.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo links_info{links_buf.buf.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo out_info{out_buf.buf.buffer, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo out_meta_info{out_meta_buf.buf.buffer, 0, VK_WHOLE_SIZE};
+
+        VkWriteDescriptorSet writes[6]{};
+        const VkDescriptorBufferInfo infos[6] = {merge_info, meta_info, sym_info, links_info, out_info, out_meta_info};
+        for (uint32_t i = 0; i < 6; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = descriptor_set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].descriptorCount = 1;
+            writes[i].pBufferInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 6, writes, 0, nullptr);
+        descriptors_dirty = false;
+    }
+
     const llama_vocab & vocab;
     int max_word_len;
     std::vector<merge_entry> merges;
     vk_context ctx;
     vk_buffer merges_buffer;
+    mapped_buffer meta_buf;
+    mapped_buffer symbols_buf;
+    mapped_buffer links_buf;
+    mapped_buffer out_buf;
+    mapped_buffer out_meta_buf;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool descriptors_dirty = true;
+    void * meta_ptr = nullptr;
+    void * symbols_ptr = nullptr;
+    void * links_ptr = nullptr;
+    void * out_ptr = nullptr;
+    void * out_meta_ptr = nullptr;
     bool ready = false;
 };
 

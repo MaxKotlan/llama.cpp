@@ -1,6 +1,11 @@
 #version 450
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// Parallel-ish BPE merge: one workgroup per word.
+// Threads cooperate to find the best-ranked merge each iteration via reduction.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Assumes max_word_len <= 256 (matches llama vocab limit).
+const uint MAX_WORD_LEN = 256;
 
 struct Merge {
     uint left;
@@ -47,6 +52,12 @@ layout(push_constant) uniform PushConsts {
     uint merge_count;
 } pc;
 
+shared uint   sh_symbols[MAX_WORD_LEN];
+shared int    sh_next[MAX_WORD_LEN];
+shared uint   sh_rank[32];
+shared int    sh_left[32];
+shared uint   sh_merged[32];
+
 bool find_merge(uint left, uint right, out uint merged, out uint rank_out) {
     uint lo = 0;
     uint hi = pc.merge_count;
@@ -67,69 +78,92 @@ bool find_merge(uint left, uint right, out uint merged, out uint rank_out) {
 }
 
 void main() {
-    uint word_id = gl_GlobalInvocationID.x;
+    uint word_id = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
     WordMeta m = meta[word_id];
-    if (m.len == 0) {
-        out_meta[word_id] = WordMeta(0, 0);
+    if (m.len == 0 || m.len > MAX_WORD_LEN) {
+        if (lane == 0) out_meta[word_id] = WordMeta(0, 0);
         return;
     }
 
-    // initialize links for the word range
-    uint start = m.offset;
-    for (uint i = 0; i < m.len; ++i) {
-        uint idx = start + i;
-        int prev = (i == 0) ? -1 : int(idx - 1);
-        int next = (i + 1 < m.len) ? int(idx + 1) : -1;
-        links[idx] = LinkPair(prev, next);
+    // load symbols and init linked list into shared
+    if (lane < m.len) {
+        uint idx = m.offset + lane;
+        sh_symbols[lane] = symbols[idx];
+        sh_next[lane] = (lane + 1 < m.len) ? int(lane + 1) : -1;
     }
+    barrier();
+
+    uint current_len = m.len;
 
     while (true) {
         uint best_rank = 0xffffffffu;
         int best_left = -1;
         uint best_merged = 0;
 
-        int cur = int(start);
-        while (cur != -1) {
-            int nxt = links[cur].next;
-            if (nxt == -1) break;
-            uint left_id = symbols[cur];
-            uint right_id = symbols[nxt];
+        // each lane scans a strided subset of pairs
+        for (uint i = lane; i + 1 < current_len; i += gl_WorkGroupSize.x) {
+            uint left_id = sh_symbols[i];
+            uint right_id = sh_symbols[i + 1];
             uint merged;
             uint rank;
             if (find_merge(left_id, right_id, merged, rank)) {
                 if (rank < best_rank) {
                     best_rank = rank;
-                    best_left = cur;
+                    best_left = int(i);
                     best_merged = merged;
                 }
             }
-            cur = nxt;
         }
 
-        if (best_left == -1) {
+        // write to shared for reduction
+        sh_rank[lane] = best_rank;
+        sh_left[lane] = best_left;
+        sh_merged[lane] = best_merged;
+        barrier();
+
+        // reduction in shared memory
+        for (uint offset = gl_WorkGroupSize.x / 2; offset > 0; offset >>= 1) {
+            if (lane < offset) {
+                uint o_rank = sh_rank[lane + offset];
+                int  o_left = sh_left[lane + offset];
+                uint o_merge = sh_merged[lane + offset];
+                if (o_rank < sh_rank[lane]) {
+                    sh_rank[lane] = o_rank;
+                    sh_left[lane] = o_left;
+                    sh_merged[lane] = o_merge;
+                }
+            }
+            barrier();
+        }
+
+        best_rank = sh_rank[0];
+        best_left = sh_left[0];
+        best_merged = sh_merged[0];
+
+        if (best_left < 0 || best_rank == 0xffffffffu) {
             break;
         }
 
-        int best_right = links[best_left].next;
-        int right_next = links[best_right].next;
-        symbols[best_left] = best_merged;
-        links[best_left].next = right_next;
-        if (right_next != -1) {
-            links[right_next].prev = best_left;
+        // lane 0 applies merge
+        if (lane == 0) {
+            uint left_idx = uint(best_left);
+            uint right_idx = left_idx + 1;
+            sh_symbols[left_idx] = best_merged;
+            // shift symbols left by 1 from right_idx+1 .. end
+            for (uint i = right_idx + 1; i < current_len; ++i) {
+                sh_symbols[i - 1] = sh_symbols[i];
+            }
+            current_len -= 1;
         }
-        symbols[best_right] = 0xffffffffu;
-        links[best_right].next = -1;
-        links[best_right].prev = -1;
+        barrier();
     }
 
-    uint out_len = 0;
-    int cur = int(start);
-    while (cur != -1) {
-        if (symbols[cur] != 0xffffffffu) {
-            out_symbols[start + out_len] = symbols[cur];
-            ++out_len;
+    // write out
+    if (lane == 0) {
+        for (uint i = 0; i < current_len; ++i) {
+            out_symbols[m.offset + i] = sh_symbols[i];
         }
-        cur = links[cur].next;
+        out_meta[word_id] = WordMeta(m.offset, current_len);
     }
-    out_meta[word_id] = WordMeta(m.offset, out_len);
 }
